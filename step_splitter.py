@@ -5,6 +5,11 @@ STEP File Splitter
 Splits STEP (ISO 10303-21) assembly files into individual part files,
 or multi-volume parts into separate volume files.
 
+Features:
+- Detects and merges duplicate parts (creates one file with count)
+- Generates report file listing all parts and their counts
+- Supports both assemblies and multi-volume parts
+
 Usage:
     python3 step_splitter.py <input.stp> [output_directory]
 
@@ -14,6 +19,7 @@ Author: Anirudha
 import re
 import os
 import sys
+import hashlib
 from datetime import datetime
 from collections import OrderedDict
 from typing import Dict, Set, List, Tuple, Optional
@@ -72,7 +78,6 @@ class StepParser:
 
     def _parse_entities(self, data_section: str) -> None:
         """Parse all entities from the DATA section."""
-        # Normalize whitespace but preserve string contents
         current_entity = []
         paren_depth = 0
         in_entity = False
@@ -99,7 +104,6 @@ class StepParser:
 
     def _parse_entity_line(self, line: str) -> None:
         """Parse a single entity line."""
-        # Match pattern: #id=TYPE(content);
         match = re.match(r'#(\d+)\s*=\s*([A-Z_0-9]+)\s*\((.*)\)\s*;', line, re.DOTALL)
         if match:
             entity_id = int(match.group(1))
@@ -107,12 +111,10 @@ class StepParser:
             content = match.group(3)
             self.entities[entity_id] = StepEntity(entity_id, entity_type, content, line)
         else:
-            # Handle complex entity types (like (TYPE1()TYPE2()TYPE3()))
             match = re.match(r'#(\d+)\s*=\s*\((.*)\)\s*;', line, re.DOTALL)
             if match:
                 entity_id = int(match.group(1))
                 content = match.group(2)
-                # Extract first type name
                 type_match = re.search(r'([A-Z_0-9]+)', content)
                 entity_type = type_match.group(1) if type_match else "COMPLEX"
                 self.entities[entity_id] = StepEntity(entity_id, entity_type, content, line)
@@ -153,7 +155,6 @@ class StepWriter:
     def write_step_file(self, output_path: str, part_name: str,
                         entity_ids: Set[int], parser: StepParser) -> None:
         """Write a STEP file with the selected entities."""
-        # Sort and renumber entities
         sorted_ids = sorted(entity_ids)
         id_mapping = {old_id: new_id for new_id, old_id in enumerate(sorted_ids, start=1)}
 
@@ -170,7 +171,6 @@ class StepWriter:
         lines.append("ENDSEC;")
         lines.append("DATA;")
 
-        # Write entities with renumbered IDs
         for old_id in sorted_ids:
             entity = parser.entities.get(old_id)
             if entity:
@@ -195,19 +195,83 @@ class StepWriter:
         return re.sub(r'#(\d+)', replace_ref, line)
 
 
+class GeometryHasher:
+    """Computes geometry hashes for duplicate detection."""
+
+    def __init__(self, parser: StepParser):
+        self.parser = parser
+
+    def compute_geometry_hash(self, solid_id: int) -> str:
+        """
+        Compute a hash of the geometry for duplicate detection.
+        This normalizes the geometry by removing entity IDs and comparing structure.
+        """
+        # Get all geometric entities for this solid
+        deps = self.parser.get_transitive_dependencies(solid_id)
+
+        # Filter to only geometric entities (not colors, styles, etc.)
+        geometric_types = {
+            'CARTESIAN_POINT', 'DIRECTION', 'VECTOR', 'LINE', 'CIRCLE', 'ELLIPSE',
+            'B_SPLINE_CURVE', 'B_SPLINE_SURFACE', 'PLANE', 'CYLINDRICAL_SURFACE',
+            'CONICAL_SURFACE', 'SPHERICAL_SURFACE', 'TOROIDAL_SURFACE',
+            'AXIS2_PLACEMENT_3D', 'AXIS1_PLACEMENT', 'VERTEX_POINT', 'EDGE_CURVE',
+            'ORIENTED_EDGE', 'EDGE_LOOP', 'FACE_OUTER_BOUND', 'FACE_BOUND',
+            'ADVANCED_FACE', 'CLOSED_SHELL', 'OPEN_SHELL', 'MANIFOLD_SOLID_BREP'
+        }
+
+        # Collect geometric content (normalized - without entity IDs)
+        geo_content = []
+        for eid in sorted(deps):
+            entity = self.parser.entities.get(eid)
+            if entity and entity.type in geometric_types:
+                # Normalize: remove entity ID, keep type and numeric values
+                normalized = self._normalize_entity(entity)
+                geo_content.append(normalized)
+
+        # Sort for consistency
+        geo_content.sort()
+
+        # Compute hash
+        content_str = '\n'.join(geo_content)
+        return hashlib.md5(content_str.encode()).hexdigest()
+
+    def _normalize_entity(self, entity: StepEntity) -> str:
+        """Normalize an entity for comparison (remove IDs, keep structure)."""
+        # Extract numeric values from the content
+        content = entity.content
+
+        # Remove all entity references (#xxx) - we only care about the numeric geometry
+        normalized = re.sub(r'#\d+', '#REF', content)
+
+        # Round floating point numbers to reduce precision issues
+        def round_number(match):
+            try:
+                num = float(match.group(0))
+                return f"{num:.6g}"
+            except:
+                return match.group(0)
+
+        normalized = re.sub(r'-?\d+\.?\d*E?[+-]?\d*', round_number, normalized)
+
+        return f"{entity.type}({normalized})"
+
+
 class StepSplitter:
     """Main class for splitting STEP files into individual parts or volumes."""
 
     def __init__(self):
         self.parser = StepParser()
         self.writer = StepWriter()
+        self.hasher = None
+        self.part_report = []  # List of (name, count) tuples
 
     def split(self, input_path: str, output_dir: str) -> None:
         """Analyze and split a STEP file into individual components."""
         print(f"Parsing STEP file: {input_path}")
         self.parser.parse(input_path)
+        self.hasher = GeometryHasher(self.parser)
+        self.part_report = []
 
-        # Create output directory
         os.makedirs(output_dir, exist_ok=True)
 
         base_name = self.parser.original_filename
@@ -231,113 +295,184 @@ class StepSplitter:
             else:
                 print("No MANIFOLD_SOLID_BREP entities found")
 
+        # Write report file
+        self._write_report(output_dir, base_name)
+
     def _split_assembly(self, output_dir: str, base_name: str) -> None:
-        """Split an assembly into individual parts."""
-        product_defs = self.parser.find_entities_by_type("PRODUCT_DEFINITION")
-        processed_products = set()
-        part_count = 0
+        """Split an assembly into individual parts with duplicate detection."""
+        # Count part occurrences from NEXT_ASSEMBLY_USAGE_OCCURRENCE
+        nauo_list = self.parser.find_entities_by_type("NEXT_ASSEMBLY_USAGE_OCCURRENCE")
 
-        for pd_id in product_defs:
-            pd = self.parser.entities.get(pd_id)
-            if not pd:
-                continue
+        # Map product definitions to their occurrence counts
+        part_occurrence_count: Dict[int, int] = {}  # product_definition_id -> count
 
-            # Find SHAPE_DEFINITION_REPRESENTATION entities
-            sdr_list = self.parser.find_entities_by_type("SHAPE_DEFINITION_REPRESENTATION")
-
-            for sdr_id in sdr_list:
-                sdr = self.parser.entities.get(sdr_id)
-                if not sdr:
-                    continue
-
-                # Check if this SDR references an ADVANCED_BREP_SHAPE_REPRESENTATION
-                for ref in sdr.references:
+        for nauo_id in nauo_list:
+            nauo = self.parser.entities.get(nauo_id)
+            if nauo:
+                # NAUO references PRODUCT_DEFINITION entities
+                for ref in nauo.references:
                     ref_entity = self.parser.entities.get(ref)
-                    if ref_entity and ref_entity.type == "ADVANCED_BREP_SHAPE_REPRESENTATION":
-                        # Check for solid bodies
-                        for shape_ref in ref_entity.references:
-                            shape_ref_entity = self.parser.entities.get(shape_ref)
-                            if shape_ref_entity and shape_ref_entity.type == "MANIFOLD_SOLID_BREP":
-                                product_name = self._extract_product_name(pd)
-                                if product_name and product_name not in processed_products:
-                                    processed_products.add(product_name)
-                                    part_count += 1
+                    if ref_entity and ref_entity.type == "PRODUCT_DEFINITION":
+                        part_occurrence_count[ref] = part_occurrence_count.get(ref, 0) + 1
 
-                                    # Get all dependencies
-                                    dependencies = self._collect_part_dependencies(shape_ref, ref)
+        # Find all MANIFOLD_SOLID_BREP entities and their product names
+        solid_bodies = self.parser.find_entities_by_type("MANIFOLD_SOLID_BREP")
 
-                                    output_filename = self._sanitize_filename(product_name) + ".stp"
-                                    output_filepath = os.path.join(output_dir, output_filename)
+        # Map each solid to its product name and count
+        solid_info: Dict[int, Tuple[str, int]] = {}  # solid_id -> (product_name, count)
 
-                                    print(f"Extracting part: {product_name}")
-                                    self.writer.write_step_file(output_filepath, product_name,
-                                                                dependencies, self.parser)
-                                    print(f"  -> Saved to: {output_filename}")
+        for solid_id in solid_bodies:
+            product_name = self._find_product_for_solid(solid_id)
+            pd_id = self._find_product_definition_for_solid(solid_id)
 
-        if part_count == 0:
-            # Fallback: extract individual solid bodies
-            print("Fallback: extracting individual solid bodies...")
-            solid_bodies = self.parser.find_entities_by_type("MANIFOLD_SOLID_BREP")
-            self._split_multi_volume_part(output_dir, base_name, solid_bodies)
-        else:
-            print(f"Extracted {part_count} unique parts from assembly")
+            if product_name:
+                # Get occurrence count from NAUO analysis
+                count = part_occurrence_count.get(pd_id, 1) if pd_id else 1
+                solid_info[solid_id] = (product_name, count)
+            else:
+                solid_info[solid_id] = (f"{base_name}-{solid_id}", 1)
+
+        # Compute geometry hashes for duplicate detection (for geometrically identical parts)
+        print("Computing geometry hashes for duplicate detection...")
+        hash_to_solids: Dict[str, List[Tuple[int, str, int]]] = {}
+
+        for solid_id, (product_name, count) in solid_info.items():
+            geo_hash = self.hasher.compute_geometry_hash(solid_id)
+            if geo_hash not in hash_to_solids:
+                hash_to_solids[geo_hash] = []
+            hash_to_solids[geo_hash].append((solid_id, product_name, count))
+
+        # Export unique parts
+        unique_count = 0
+        total_instances = 0
+
+        for geo_hash, solids_list in hash_to_solids.items():
+            # Sum counts for geometrically identical parts
+            total_count = sum(item[2] for item in solids_list)
+            total_instances += total_count
+
+            # Use the first solid and its name
+            solid_id, product_name, _ = solids_list[0]
+            unique_count += 1
+
+            # Collect dependencies
+            dependencies = self._collect_solid_dependencies(solid_id)
+
+            # Generate filename
+            output_filename = self._sanitize_filename(product_name) + ".stp"
+            output_filepath = os.path.join(output_dir, output_filename)
+
+            if total_count > 1:
+                print(f"Extracting part: {product_name} (x{total_count} instances)")
+            else:
+                print(f"Extracting part: {product_name}")
+
+            self.writer.write_step_file(output_filepath, product_name, dependencies, self.parser)
+            print(f"  -> Saved to: {output_filename}")
+
+            # Add to report
+            self.part_report.append((product_name, total_count))
+
+        print(f"\nExtracted {unique_count} unique parts from {total_instances} total instances")
 
     def _split_multi_volume_part(self, output_dir: str, base_name: str,
                                   solid_bodies: List[int]) -> None:
-        """Split a part with multiple volumes into separate files."""
-        for volume_count, solid_id in enumerate(solid_bodies, start=1):
-            # Collect all entities needed for this solid body
+        """Split a part with multiple volumes with duplicate detection."""
+        # Compute geometry hashes for duplicate detection
+        print("Computing geometry hashes for duplicate detection...")
+        hash_to_solids: Dict[str, List[int]] = {}
+
+        for solid_id in solid_bodies:
+            geo_hash = self.hasher.compute_geometry_hash(solid_id)
+            if geo_hash not in hash_to_solids:
+                hash_to_solids[geo_hash] = []
+            hash_to_solids[geo_hash].append(solid_id)
+
+        # Export unique volumes
+        unique_count = 0
+        total_instances = len(solid_bodies)
+
+        for geo_hash, solids_list in hash_to_solids.items():
+            count = len(solids_list)
+            unique_count += 1
+
+            # Use the first solid
+            solid_id = solids_list[0]
+
+            # Collect dependencies
             dependencies = self._collect_solid_dependencies(solid_id)
 
-            part_name = f"{base_name}_{volume_count}"
+            # Generate filename using the first solid's ID to maintain uniqueness
+            part_name = f"{base_name}_{unique_count}"
             output_filename = f"{part_name}.stp"
             output_filepath = os.path.join(output_dir, output_filename)
 
-            print(f"Extracting volume {volume_count}: {part_name}")
+            if count > 1:
+                print(f"Extracting volume {unique_count}: {part_name} (x{count} identical instances)")
+            else:
+                print(f"Extracting volume {unique_count}: {part_name}")
+
             self.writer.write_step_file(output_filepath, part_name, dependencies, self.parser)
             print(f"  -> Saved to: {output_filename}")
 
-        print(f"Extracted {len(solid_bodies)} volumes from part")
+            # Add to report
+            self.part_report.append((part_name, count))
+
+        print(f"\nExtracted {unique_count} unique volumes from {total_instances} total instances")
 
     def _export_single_part(self, output_dir: str, base_name: str, solid_id: int) -> None:
         """Export a single part."""
         dependencies = self._collect_solid_dependencies(solid_id)
 
-        output_filename = f"{base_name}_1.stp"
+        part_name = f"{base_name}_1"
+        output_filename = f"{part_name}.stp"
         output_filepath = os.path.join(output_dir, output_filename)
 
         print(f"Exporting single part: {base_name}")
-        self.writer.write_step_file(output_filepath, base_name, dependencies, self.parser)
+        self.writer.write_step_file(output_filepath, part_name, dependencies, self.parser)
         print(f"  -> Saved to: {output_filename}")
+
+        self.part_report.append((part_name, 1))
+
+    def _find_product_for_solid(self, solid_id: int) -> Optional[str]:
+        """Find the product name associated with a solid body."""
+        pd = self._find_product_definition_entity_for_solid(solid_id)
+        if pd:
+            return self._extract_product_name(pd)
+        return None
+
+    def _find_product_definition_for_solid(self, solid_id: int) -> Optional[int]:
+        """Find the PRODUCT_DEFINITION entity ID for a solid body."""
+        pd = self._find_product_definition_entity_for_solid(solid_id)
+        return pd.id if pd else None
+
+    def _find_product_definition_entity_for_solid(self, solid_id: int) -> Optional[StepEntity]:
+        """Find the PRODUCT_DEFINITION entity associated with a solid body."""
+        # Find ADVANCED_BREP_SHAPE_REPRESENTATION containing this solid
+        for abrep_id in self.parser.find_entities_by_type("ADVANCED_BREP_SHAPE_REPRESENTATION"):
+            abrep = self.parser.entities.get(abrep_id)
+            if abrep and solid_id in abrep.references:
+                # Find SHAPE_DEFINITION_REPRESENTATION referencing this ABREP
+                for sdr_id in self.parser.find_entities_by_type("SHAPE_DEFINITION_REPRESENTATION"):
+                    sdr = self.parser.entities.get(sdr_id)
+                    if sdr and abrep_id in sdr.references:
+                        # Find PRODUCT_DEFINITION_SHAPE
+                        for ref in sdr.references:
+                            pds = self.parser.entities.get(ref)
+                            if pds and pds.type == "PRODUCT_DEFINITION_SHAPE":
+                                # Find PRODUCT_DEFINITION
+                                for pds_ref in pds.references:
+                                    pd = self.parser.entities.get(pds_ref)
+                                    if pd and pd.type == "PRODUCT_DEFINITION":
+                                        return pd
+        return None
 
     def _collect_solid_dependencies(self, solid_id: int) -> Set[int]:
         """Collect all entities required for a solid body."""
         required = set()
-
-        # Start with the solid body and all its dependencies
         required.update(self.parser.get_transitive_dependencies(solid_id))
-
-        # Add common entities
         self._add_common_entities(required)
-
-        # Add product and shape definition entities
         self._add_product_entities(required, solid_id)
-
-        return required
-
-    def _collect_part_dependencies(self, solid_id: int, shape_rep_id: int) -> Set[int]:
-        """Collect all entities required for a part in an assembly."""
-        required = set()
-
-        # Get solid body dependencies
-        required.update(self.parser.get_transitive_dependencies(solid_id))
-
-        # Get shape representation dependencies
-        required.update(self.parser.get_transitive_dependencies(shape_rep_id))
-
-        # Add common entities
-        self._add_common_entities(required)
-
         return required
 
     def _add_common_entities(self, entities: Set[int]) -> None:
@@ -354,7 +489,6 @@ class StepSplitter:
             'REPRESENTATION_CONTEXT', 'PLANE_ANGLE_MEASURE_WITH_UNIT'
         }
 
-        # Find entities that are referenced by our current set
         entities_to_add = set()
         for entity_id in list(entities):
             entity = self.parser.entities.get(entity_id)
@@ -370,14 +504,12 @@ class StepSplitter:
 
     def _add_product_entities(self, entities: Set[int], solid_id: int) -> None:
         """Add product definition entities for a solid."""
-        # Find STYLED_ITEM referencing this solid
         for styled_item_id in self.parser.find_entities_by_type("STYLED_ITEM"):
             styled_item = self.parser.entities.get(styled_item_id)
             if styled_item and solid_id in styled_item.references:
                 entities.add(styled_item_id)
                 entities.update(self.parser.get_transitive_dependencies(styled_item_id))
 
-        # Find MECHANICAL_DESIGN_GEOMETRIC_PRESENTATION_REPRESENTATION
         for mdgpr_id in self.parser.find_entities_by_type("MECHANICAL_DESIGN_GEOMETRIC_PRESENTATION_REPRESENTATION"):
             mdgpr = self.parser.entities.get(mdgpr_id)
             if mdgpr:
@@ -394,7 +526,6 @@ class StepSplitter:
                 for prod_ref in pdf_entity.references:
                     product = self.parser.entities.get(prod_ref)
                     if product and product.type == "PRODUCT":
-                        # Extract name from PRODUCT('name','description',...)
                         match = re.search(r"'([^']+)'", product.content)
                         if match:
                             return match.group(1)
@@ -404,6 +535,27 @@ class StepSplitter:
         """Sanitize a string for use as a filename."""
         return re.sub(r'[^a-zA-Z0-9_\-]', '_', name)
 
+    def _write_report(self, output_dir: str, base_name: str) -> None:
+        """Write a report file listing all parts and their counts."""
+        report_filename = f"{base_name}.txt"
+        report_filepath = os.path.join(output_dir, "..", report_filename)
+
+        # If output_dir is already the base dir (not RESULT), write in output_dir
+        if not output_dir.endswith("RESULT"):
+            report_filepath = os.path.join(output_dir, report_filename)
+
+        lines = []
+        for part_name, count in self.part_report:
+            if count > 1:
+                lines.append(f"{part_name};{count}")
+            else:
+                lines.append(part_name)
+
+        with open(report_filepath, 'w', encoding='utf-8') as f:
+            f.write('\n'.join(lines))
+
+        print(f"\nReport saved to: {report_filename}")
+
 
 def main():
     if len(sys.argv) < 2:
@@ -411,6 +563,10 @@ def main():
         print("==================")
         print("Splits STEP assembly files into individual part files,")
         print("or multi-volume parts into separate volume files.")
+        print()
+        print("Features:")
+        print("- Detects and merges duplicate parts (creates one file with count)")
+        print("- Generates report file listing all parts and their counts")
         print()
         print("Usage: python3 step_splitter.py <input.stp> [output_directory]")
         print()
@@ -422,6 +578,11 @@ def main():
         print("Examples:")
         print("  python3 step_splitter.py assembly.stp")
         print("  python3 step_splitter.py part.stp ./output")
+        print()
+        print("Output:")
+        print("  - Individual .stp files for each unique part/volume")
+        print("  - A .txt report file with part names and counts")
+        print("    (e.g., 'PART_NAME;4' means 4 identical copies)")
         return
 
     input_path = sys.argv[1]
@@ -429,7 +590,6 @@ def main():
     if len(sys.argv) >= 3:
         output_dir = sys.argv[2]
     else:
-        # Default to RESULT directory in the same location as input file
         parent_dir = os.path.dirname(input_path) or "."
         output_dir = os.path.join(parent_dir, "RESULT")
 
