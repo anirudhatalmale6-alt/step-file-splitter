@@ -402,9 +402,16 @@ class StepSplitter:
             # Collect dependencies
             dependencies = self._collect_solid_dependencies(solid_id)
 
-            # Generate filename using the first solid's ID to maintain uniqueness
-            part_name = f"{base_name}_{unique_count}"
-            output_filename = f"{part_name}.stp"
+            # Try to get part name from the solid body entity itself
+            part_name = self._get_solid_name(solid_id)
+            if not part_name:
+                # Fallback to product name lookup
+                part_name = self._find_product_for_solid(solid_id)
+            if not part_name:
+                # Final fallback: use base_name with counter
+                part_name = f"{base_name}_{unique_count}"
+
+            output_filename = f"{self._sanitize_filename(part_name)}.stp"
             output_filepath = os.path.join(output_dir, output_filename)
 
             if count > 1:
@@ -424,15 +431,36 @@ class StepSplitter:
         """Export a single part."""
         dependencies = self._collect_solid_dependencies(solid_id)
 
-        part_name = f"{base_name}_1"
-        output_filename = f"{part_name}.stp"
+        # Try to get part name from the solid body entity itself
+        part_name = self._get_solid_name(solid_id)
+        if not part_name:
+            # Fallback to product name lookup
+            part_name = self._find_product_for_solid(solid_id)
+        if not part_name:
+            # Final fallback: use base_name with counter
+            part_name = f"{base_name}_1"
+
+        output_filename = f"{self._sanitize_filename(part_name)}.stp"
         output_filepath = os.path.join(output_dir, output_filename)
 
-        print(f"Exporting single part: {base_name}")
+        print(f"Exporting single part: {part_name}")
         self.writer.write_step_file(output_filepath, part_name, dependencies, self.parser)
         print(f"  -> Saved to: {output_filename}")
 
         self.part_report.append((part_name, 1))
+
+    def _get_solid_name(self, solid_id: int) -> Optional[str]:
+        """Extract the name directly from a MANIFOLD_SOLID_BREP entity."""
+        entity = self.parser.entities.get(solid_id)
+        if entity and entity.type == "MANIFOLD_SOLID_BREP":
+            # MANIFOLD_SOLID_BREP('name',#shell_ref)
+            # Extract the first quoted string (the name)
+            match = re.search(r"'([^']*)'", entity.content)
+            if match:
+                name = match.group(1).strip()
+                if name:  # Only return if name is not empty
+                    return name
+        return None
 
     def _find_product_for_solid(self, solid_id: int) -> Optional[str]:
         """Find the product name associated with a solid body."""
@@ -544,8 +572,11 @@ class StepSplitter:
         if not output_dir.endswith("RESULT"):
             report_filepath = os.path.join(output_dir, report_filename)
 
+        # Sort by part name
+        sorted_report = sorted(self.part_report, key=lambda x: x[0])
+
         lines = []
-        for part_name, count in self.part_report:
+        for part_name, count in sorted_report:
             if count > 1:
                 lines.append(f"{part_name};{count}")
             else:
