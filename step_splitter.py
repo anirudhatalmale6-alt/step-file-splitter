@@ -480,19 +480,46 @@ class StepSplitter:
         for abrep_id in self.parser.find_entities_by_type("ADVANCED_BREP_SHAPE_REPRESENTATION"):
             abrep = self.parser.entities.get(abrep_id)
             if abrep and solid_id in abrep.references:
-                # Find SHAPE_DEFINITION_REPRESENTATION referencing this ABREP
+                # Method 1: Direct - Find SHAPE_DEFINITION_REPRESENTATION referencing this ABREP
                 for sdr_id in self.parser.find_entities_by_type("SHAPE_DEFINITION_REPRESENTATION"):
                     sdr = self.parser.entities.get(sdr_id)
                     if sdr and abrep_id in sdr.references:
-                        # Find PRODUCT_DEFINITION_SHAPE
-                        for ref in sdr.references:
-                            pds = self.parser.entities.get(ref)
-                            if pds and pds.type == "PRODUCT_DEFINITION_SHAPE":
-                                # Find PRODUCT_DEFINITION
-                                for pds_ref in pds.references:
-                                    pd = self.parser.entities.get(pds_ref)
-                                    if pd and pd.type == "PRODUCT_DEFINITION":
-                                        return pd
+                        pd = self._get_product_definition_from_sdr(sdr)
+                        if pd:
+                            return pd
+
+                # Method 2: Via SHAPE_REPRESENTATION_RELATIONSHIP
+                # Some STEP files link ADVANCED_BREP_SHAPE_REPRESENTATION to SHAPE_REPRESENTATION
+                # via SHAPE_REPRESENTATION_RELATIONSHIP, then SDR references the SHAPE_REPRESENTATION
+                for srr_id in self.parser.find_entities_by_type("SHAPE_REPRESENTATION_RELATIONSHIP"):
+                    srr = self.parser.entities.get(srr_id)
+                    if srr and abrep_id in srr.references:
+                        # Find the SHAPE_REPRESENTATION also referenced by this relationship
+                        for shape_rep_id in srr.references:
+                            if shape_rep_id == abrep_id:
+                                continue
+                            shape_rep = self.parser.entities.get(shape_rep_id)
+                            if shape_rep and shape_rep.type == "SHAPE_REPRESENTATION":
+                                # Find SDR referencing this SHAPE_REPRESENTATION
+                                for sdr_id in self.parser.find_entities_by_type("SHAPE_DEFINITION_REPRESENTATION"):
+                                    sdr = self.parser.entities.get(sdr_id)
+                                    if sdr and shape_rep_id in sdr.references:
+                                        pd = self._get_product_definition_from_sdr(sdr)
+                                        if pd:
+                                            return pd
+        return None
+
+    def _get_product_definition_from_sdr(self, sdr: StepEntity) -> Optional[StepEntity]:
+        """Extract PRODUCT_DEFINITION from a SHAPE_DEFINITION_REPRESENTATION."""
+        # Find PRODUCT_DEFINITION_SHAPE referenced by SDR
+        for ref in sdr.references:
+            pds = self.parser.entities.get(ref)
+            if pds and pds.type == "PRODUCT_DEFINITION_SHAPE":
+                # Find PRODUCT_DEFINITION referenced by PDS
+                for pds_ref in pds.references:
+                    pd = self.parser.entities.get(pds_ref)
+                    if pd and pd.type == "PRODUCT_DEFINITION":
+                        return pd
         return None
 
     def _collect_solid_dependencies(self, solid_id: int) -> Set[int]:
@@ -566,11 +593,8 @@ class StepSplitter:
     def _write_report(self, output_dir: str, base_name: str) -> None:
         """Write a report file listing all parts and their counts."""
         report_filename = f"{base_name}.txt"
-        report_filepath = os.path.join(output_dir, "..", report_filename)
-
-        # If output_dir is already the base dir (not RESULT), write in output_dir
-        if not output_dir.endswith("RESULT"):
-            report_filepath = os.path.join(output_dir, report_filename)
+        # Report file goes inside the SPLIT folder
+        report_filepath = os.path.join(output_dir, report_filename)
 
         # Sort by part name
         sorted_report = sorted(self.part_report, key=lambda x: x[0])
@@ -617,12 +641,13 @@ def main():
         return
 
     input_path = sys.argv[1]
+    base_name = os.path.splitext(os.path.basename(input_path))[0]
 
     if len(sys.argv) >= 3:
         output_dir = sys.argv[2]
     else:
         parent_dir = os.path.dirname(input_path) or "."
-        output_dir = os.path.join(parent_dir, "RESULT")
+        output_dir = os.path.join(parent_dir, f"SPLIT-{base_name}")
 
     try:
         splitter = StepSplitter()
