@@ -391,6 +391,7 @@ class StepSplitter:
         # Export unique volumes
         unique_count = 0
         total_instances = len(solid_bodies)
+        used_names: Dict[str, int] = {}  # Track name usage for deduplication
 
         for geo_hash, solids_list in hash_to_solids.items():
             count = len(solids_list)
@@ -411,7 +412,16 @@ class StepSplitter:
                 # Final fallback: use base_name with counter
                 part_name = f"{base_name}_{unique_count}"
 
-            output_filename = f"{self._sanitize_filename(part_name)}.stp"
+            # Handle duplicate names by adding entity ID suffix
+            sanitized = self._sanitize_filename(part_name)
+            if sanitized in used_names:
+                used_names[sanitized] += 1
+                part_name = f"{part_name}-{solid_id}"
+                sanitized = self._sanitize_filename(part_name)
+            else:
+                used_names[sanitized] = 1
+
+            output_filename = f"{sanitized}.stp"
             output_filepath = os.path.join(output_dir, output_filename)
 
             if count > 1:
@@ -523,55 +533,117 @@ class StepSplitter:
         return None
 
     def _collect_solid_dependencies(self, solid_id: int) -> Set[int]:
-        """Collect all entities required for a solid body."""
+        """Collect all entities required for a solid body, including product structure."""
         required = set()
+        # Get pure geometry dependencies (downward from solid)
         required.update(self.parser.get_transitive_dependencies(solid_id))
-        self._add_common_entities(required)
-        self._add_product_entities(required, solid_id)
+
+        # Add ADVANCED_BREP_SHAPE_REPRESENTATION that contains this solid
+        # This provides the geometric context and units needed by OpenCASCADE
+        abrep_id_found = None
+        for abrep_id in self.parser.find_entities_by_type("ADVANCED_BREP_SHAPE_REPRESENTATION"):
+            abrep = self.parser.entities.get(abrep_id)
+            if abrep and solid_id in abrep.references:
+                abrep_id_found = abrep_id
+                required.add(abrep_id)
+                # Add the context/units referenced by ABREP
+                for ref in abrep.references:
+                    if ref != solid_id:
+                        required.add(ref)
+                        required.update(self.parser.get_transitive_dependencies(ref))
+                break
+
+        # Add product structure entities (PRODUCT_DEFINITION, PRODUCT, etc.)
+        self._add_product_structure(required, solid_id, abrep_id_found)
+
+        # Add styling for this specific solid only
+        self._add_styled_items_for_solid(required, solid_id)
+
         return required
 
-    def _add_common_entities(self, entities: Set[int]) -> None:
-        """Add common entities like colors, units, etc."""
-        common_types = {
-            'COLOUR_RGB', 'DRAUGHTING_PRE_DEFINED_COLOUR', 'DRAUGHTING_PRE_DEFINED_CURVE_FONT',
-            'FILL_AREA_STYLE', 'FILL_AREA_STYLE_COLOUR',
-            'SURFACE_STYLE_FILL_AREA', 'SURFACE_SIDE_STYLE', 'SURFACE_STYLE_USAGE',
-            'PRESENTATION_STYLE_ASSIGNMENT', 'PRESENTATION_LAYER_ASSIGNMENT',
-            'CURVE_STYLE', 'LENGTH_UNIT', 'NAMED_UNIT', 'SI_UNIT',
-            'PLANE_ANGLE_UNIT', 'SOLID_ANGLE_UNIT', 'CONVERSION_BASED_UNIT',
-            'UNCERTAINTY_MEASURE_WITH_UNIT', 'GLOBAL_UNCERTAINTY_ASSIGNED_CONTEXT',
-            'GLOBAL_UNIT_ASSIGNED_CONTEXT', 'GEOMETRIC_REPRESENTATION_CONTEXT',
-            'REPRESENTATION_CONTEXT', 'PLANE_ANGLE_MEASURE_WITH_UNIT'
-        }
+    def _add_product_structure(self, entities: Set[int], solid_id: int,
+                                abrep_id: Optional[int]) -> None:
+        """Add PRODUCT_DEFINITION and related entities for a solid body.
 
-        entities_to_add = set()
-        for entity_id in list(entities):
-            entity = self.parser.entities.get(entity_id)
-            if entity:
-                for ref in entity.references:
-                    ref_entity = self.parser.entities.get(ref)
-                    if ref_entity and (ref_entity.type in common_types or
-                                       any(t in ref_entity.type for t in ['UNIT', 'CONTEXT', 'COLOUR'])):
-                        entities_to_add.add(ref)
-                        entities_to_add.update(self.parser.get_transitive_dependencies(ref))
+        This creates the product wrapper that OpenCASCADE requires:
+        APPLICATION_CONTEXT -> PRODUCT_DEFINITION_CONTEXT -> PRODUCT_DEFINITION
+        -> PRODUCT_DEFINITION_FORMATION -> PRODUCT
+        -> PRODUCT_DEFINITION_SHAPE -> SHAPE_DEFINITION_REPRESENTATION
+        """
+        if not abrep_id:
+            return
 
-        entities.update(entities_to_add)
+        # Find SHAPE_REPRESENTATION linked to this ABREP
+        # Method 1: Direct SDR referencing ABREP
+        for sdr_id in self.parser.find_entities_by_type("SHAPE_DEFINITION_REPRESENTATION"):
+            sdr = self.parser.entities.get(sdr_id)
+            if sdr and abrep_id in sdr.references:
+                entities.add(sdr_id)
+                self._add_sdr_chain(entities, sdr)
+                return
 
-    def _add_product_entities(self, entities: Set[int], solid_id: int) -> None:
-        """Add product definition entities for a solid."""
+        # Method 2: Via SHAPE_REPRESENTATION_RELATIONSHIP
+        for srr_id in self.parser.find_entities_by_type("SHAPE_REPRESENTATION_RELATIONSHIP"):
+            srr = self.parser.entities.get(srr_id)
+            if srr and abrep_id in srr.references:
+                entities.add(srr_id)
+                # Find SHAPE_REPRESENTATION linked by this relationship
+                for shape_rep_id in srr.references:
+                    if shape_rep_id == abrep_id:
+                        continue
+                    shape_rep = self.parser.entities.get(shape_rep_id)
+                    if shape_rep and shape_rep.type == "SHAPE_REPRESENTATION":
+                        entities.add(shape_rep_id)
+                        entities.update(self.parser.get_transitive_dependencies(shape_rep_id))
+                        # Find SDR referencing this SHAPE_REPRESENTATION
+                        for sdr_id in self.parser.find_entities_by_type("SHAPE_DEFINITION_REPRESENTATION"):
+                            sdr = self.parser.entities.get(sdr_id)
+                            if sdr and shape_rep_id in sdr.references:
+                                entities.add(sdr_id)
+                                self._add_sdr_chain(entities, sdr)
+                                return
+
+    def _add_sdr_chain(self, entities: Set[int], sdr: StepEntity) -> None:
+        """Add the full product chain from a SHAPE_DEFINITION_REPRESENTATION."""
+        for ref in sdr.references:
+            pds = self.parser.entities.get(ref)
+            if pds and pds.type == "PRODUCT_DEFINITION_SHAPE":
+                entities.add(pds.id)
+                # Get PRODUCT_DEFINITION
+                for pds_ref in pds.references:
+                    pd = self.parser.entities.get(pds_ref)
+                    if pd and pd.type == "PRODUCT_DEFINITION":
+                        entities.add(pd.id)
+                        # Add all transitive deps of PRODUCT_DEFINITION
+                        # (PRODUCT_DEFINITION_FORMATION, PRODUCT, PRODUCT_CONTEXT,
+                        #  APPLICATION_CONTEXT, APPLICATION_PROTOCOL_DEFINITION, etc.)
+                        entities.update(self.parser.get_transitive_dependencies(pd.id))
+
+                        # Also find PROPERTY_DEFINITION entities referencing this PD
+                        for prop_id in self.parser.find_entities_by_type("PROPERTY_DEFINITION"):
+                            prop = self.parser.entities.get(prop_id)
+                            if prop and pd.id in prop.references:
+                                entities.add(prop_id)
+                                entities.update(self.parser.get_transitive_dependencies(prop_id))
+                                # Find PROPERTY_DEFINITION_REPRESENTATION
+                                for pdr_id in self.parser.find_entities_by_type("PROPERTY_DEFINITION_REPRESENTATION"):
+                                    pdr = self.parser.entities.get(pdr_id)
+                                    if pdr and prop_id in pdr.references:
+                                        entities.add(pdr_id)
+                                        entities.update(self.parser.get_transitive_dependencies(pdr_id))
+
+    def _add_styled_items_for_solid(self, entities: Set[int], solid_id: int) -> None:
+        """Add STYLED_ITEM and its styling dependencies for a specific solid only."""
         for styled_item_id in self.parser.find_entities_by_type("STYLED_ITEM"):
             styled_item = self.parser.entities.get(styled_item_id)
             if styled_item and solid_id in styled_item.references:
+                # Add the styled item itself
                 entities.add(styled_item_id)
-                entities.update(self.parser.get_transitive_dependencies(styled_item_id))
-
-        for mdgpr_id in self.parser.find_entities_by_type("MECHANICAL_DESIGN_GEOMETRIC_PRESENTATION_REPRESENTATION"):
-            mdgpr = self.parser.entities.get(mdgpr_id)
-            if mdgpr:
-                for ref in mdgpr.references:
-                    if ref in entities:
-                        entities.update(self.parser.get_transitive_dependencies(mdgpr_id))
-                        break
+                # Add only the styling chain (not the geometry which is already included)
+                for ref in styled_item.references:
+                    if ref != solid_id:
+                        entities.add(ref)
+                        entities.update(self.parser.get_transitive_dependencies(ref))
 
     def _extract_product_name(self, product_def: StepEntity) -> Optional[str]:
         """Extract product name from PRODUCT_DEFINITION."""
@@ -601,10 +673,7 @@ class StepSplitter:
 
         lines = []
         for part_name, count in sorted_report:
-            if count > 1:
-                lines.append(f"{part_name};{count}")
-            else:
-                lines.append(part_name)
+            lines.append(f"{part_name};{count}")
 
         with open(report_filepath, 'w', encoding='utf-8') as f:
             f.write('\n'.join(lines))
