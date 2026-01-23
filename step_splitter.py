@@ -634,22 +634,30 @@ class StepSplitter:
 
     def _add_styled_items_for_solid(self, entities: Set[int], solid_id: int) -> None:
         """Add STYLED_ITEM and its styling dependencies for a specific solid only."""
+        # STYLED_ITEM can reference the solid directly OR any entity within its geometry tree
+        # (e.g., ADVANCED_FACE entities)
+        geo_deps = self.parser.get_transitive_dependencies(solid_id)
+
         for styled_item_id in self.parser.find_entities_by_type("STYLED_ITEM"):
             styled_item = self.parser.entities.get(styled_item_id)
-            if styled_item and solid_id in styled_item.references:
-                # Add the styled item itself
-                entities.add(styled_item_id)
-                # Add only the styling chain (not the geometry which is already included)
-                for ref in styled_item.references:
-                    if ref != solid_id:
-                        entities.add(ref)
-                        entities.update(self.parser.get_transitive_dependencies(ref))
+            if styled_item:
+                # Check if any of the styled item's references are in our geometry
+                if styled_item.references & geo_deps:
+                    entities.add(styled_item_id)
+                    # Add only the styling chain (not the geometry which is already included)
+                    for ref in styled_item.references:
+                        if ref not in geo_deps:
+                            entities.add(ref)
+                            entities.update(self.parser.get_transitive_dependencies(ref))
 
     def _extract_product_name(self, product_def: StepEntity) -> Optional[str]:
         """Extract product name from PRODUCT_DEFINITION."""
         for ref in product_def.references:
             pdf_entity = self.parser.entities.get(ref)
-            if pdf_entity and pdf_entity.type == "PRODUCT_DEFINITION_FORMATION_WITH_SPECIFIED_SOURCE":
+            if pdf_entity and pdf_entity.type in (
+                "PRODUCT_DEFINITION_FORMATION_WITH_SPECIFIED_SOURCE",
+                "PRODUCT_DEFINITION_FORMATION"
+            ):
                 for prod_ref in pdf_entity.references:
                     product = self.parser.entities.get(prod_ref)
                     if product and product.type == "PRODUCT":
