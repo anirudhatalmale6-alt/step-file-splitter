@@ -153,10 +153,21 @@ class StepWriter:
     FILE_SCHEMA = "'AP203_CONFIGURATION_CONTROLLED_3D_DESIGN_OF_MECHANICAL_PARTS_AND_ASSEMBLIES_MIM_LF { 1 0 10303 403 2 1 2 }'"
 
     def write_step_file(self, output_path: str, part_name: str,
-                        entity_ids: Set[int], parser: StepParser) -> None:
-        """Write a STEP file with the selected entities."""
+                        entity_ids: Set[int], parser: StepParser,
+                        solid_id: int = None, context_id: int = None) -> None:
+        """Write a STEP file with the selected entities.
+
+        If solid_id and context_id are provided, a synthetic ADVANCED_BREP_SHAPE_REPRESENTATION
+        will be created that references only this solid (for files where all solids share
+        one ABREP).
+        """
         sorted_ids = sorted(entity_ids)
         id_mapping = {old_id: new_id for new_id, old_id in enumerate(sorted_ids, start=1)}
+
+        # Reserve an ID for synthetic ABREP if needed
+        synthetic_abrep_id = None
+        if solid_id is not None and context_id is not None:
+            synthetic_abrep_id = len(sorted_ids) + 1
 
         lines = []
         lines.append("ISO-10303-21;")
@@ -176,6 +187,12 @@ class StepWriter:
             if entity:
                 line = self._renumber_references(entity.full_line, id_mapping)
                 lines.append(line)
+
+        # Add synthetic ADVANCED_BREP_SHAPE_REPRESENTATION if needed
+        if synthetic_abrep_id is not None:
+            new_solid_id = id_mapping.get(solid_id, 1)
+            new_context_id = id_mapping.get(context_id, 2)
+            lines.append(f"#{synthetic_abrep_id}=ADVANCED_BREP_SHAPE_REPRESENTATION('',(#{new_solid_id}),#{new_context_id});")
 
         lines.append("ENDSEC;")
         lines.append("END-ISO-10303-21;")
@@ -216,7 +233,8 @@ class GeometryHasher:
             'CONICAL_SURFACE', 'SPHERICAL_SURFACE', 'TOROIDAL_SURFACE',
             'AXIS2_PLACEMENT_3D', 'AXIS1_PLACEMENT', 'VERTEX_POINT', 'EDGE_CURVE',
             'ORIENTED_EDGE', 'EDGE_LOOP', 'FACE_OUTER_BOUND', 'FACE_BOUND',
-            'ADVANCED_FACE', 'CLOSED_SHELL', 'OPEN_SHELL', 'MANIFOLD_SOLID_BREP'
+            'ADVANCED_FACE', 'CLOSED_SHELL', 'OPEN_SHELL', 'MANIFOLD_SOLID_BREP',
+            'BREP_WITH_VOIDS'
         }
 
         # Collect geometric content (normalized - without entity IDs)
@@ -259,11 +277,26 @@ class GeometryHasher:
 class StepSplitter:
     """Main class for splitting STEP files into individual parts or volumes."""
 
+    # Solid body entity types
+    SOLID_TYPES = {"MANIFOLD_SOLID_BREP", "BREP_WITH_VOIDS"}
+
     def __init__(self):
         self.parser = StepParser()
         self.writer = StepWriter()
         self.hasher = None
         self.part_report = []  # List of (name, count) tuples
+
+    def _find_all_solid_bodies(self) -> List[int]:
+        """Find all solid body entities (MANIFOLD_SOLID_BREP + BREP_WITH_VOIDS)."""
+        solids = []
+        for stype in self.SOLID_TYPES:
+            solids.extend(self.parser.find_entities_by_type(stype))
+        return solids
+
+    def _is_solid_body(self, entity_id: int) -> bool:
+        """Check if an entity is a solid body type."""
+        entity = self.parser.entities.get(entity_id)
+        return entity is not None and entity.type in self.SOLID_TYPES
 
     def split(self, input_path: str, output_dir: str) -> None:
         """Analyze and split a STEP file into individual components."""
@@ -284,7 +317,7 @@ class StepSplitter:
             self._split_assembly(output_dir, base_name)
         else:
             # Check for multiple volumes/solids
-            solid_bodies = self.parser.find_entities_by_type("MANIFOLD_SOLID_BREP")
+            solid_bodies = self._find_all_solid_bodies()
 
             if len(solid_bodies) > 1:
                 print(f"Detected PART with {len(solid_bodies)} solid bodies/volumes")
@@ -293,85 +326,294 @@ class StepSplitter:
                 print("Single solid body detected - exporting as single part file")
                 self._export_single_part(output_dir, base_name, solid_bodies[0])
             else:
-                print("No MANIFOLD_SOLID_BREP entities found")
+                print("No solid body entities found")
 
         # Write report file
         self._write_report(output_dir, base_name)
 
-    def _split_assembly(self, output_dir: str, base_name: str) -> None:
-        """Split an assembly into individual parts with duplicate detection."""
-        # Count part occurrences from NEXT_ASSEMBLY_USAGE_OCCURRENCE
+    def _build_nauo_tree(self) -> Tuple[Dict[int, List[int]], int]:
+        """Build the NAUO parent-child tree and find the root assembly PD.
+
+        NAUO format: NEXT_ASSEMBLY_USAGE_OCCURRENCE('id','name','desc',#parent_pd,#child_pd,$)
+        The 4th argument is the parent (relating) PD, 5th is the child (related) PD.
+
+        Returns:
+            Tuple of (children_map, root_pd_id) where children_map maps each
+            parent PD to a list of child PDs (one entry per NAUO = one placement).
+        """
         nauo_list = self.parser.find_entities_by_type("NEXT_ASSEMBLY_USAGE_OCCURRENCE")
 
-        # Map product definitions to their occurrence counts
-        part_occurrence_count: Dict[int, int] = {}  # product_definition_id -> count
+        # Map: parent_pd -> [child_pd, child_pd, ...] (one per NAUO placement)
+        children_map: Dict[int, List[int]] = {}
+        all_children: Set[int] = set()
+        all_parents: Set[int] = set()
 
         for nauo_id in nauo_list:
             nauo = self.parser.entities.get(nauo_id)
-            if nauo:
-                # NAUO references PRODUCT_DEFINITION entities
-                for ref in nauo.references:
-                    ref_entity = self.parser.entities.get(ref)
-                    if ref_entity and ref_entity.type == "PRODUCT_DEFINITION":
-                        part_occurrence_count[ref] = part_occurrence_count.get(ref, 0) + 1
+            if not nauo:
+                continue
 
-        # Find all MANIFOLD_SOLID_BREP entities and their product names
-        solid_bodies = self.parser.find_entities_by_type("MANIFOLD_SOLID_BREP")
+            # Parse NAUO content to extract ordered PD references
+            # NAUO('id','name','desc',#parent_pd,#child_pd,$)
+            # Extract all #xxx references in order from the full line
+            ordered_refs = [int(m.group(1)) for m in re.finditer(r'#(\d+)', nauo.content)]
 
-        # Map each solid to its product name and count
-        solid_info: Dict[int, Tuple[str, int]] = {}  # solid_id -> (product_name, count)
+            # Filter to only PRODUCT_DEFINITION refs (in order)
+            pd_refs = []
+            for ref in ordered_refs:
+                ref_entity = self.parser.entities.get(ref)
+                if ref_entity and ref_entity.type == "PRODUCT_DEFINITION":
+                    pd_refs.append(ref)
 
-        for solid_id in solid_bodies:
-            product_name = self._find_product_for_solid(solid_id)
-            pd_id = self._find_product_definition_for_solid(solid_id)
+            if len(pd_refs) >= 2:
+                parent_pd = pd_refs[0]
+                child_pd = pd_refs[1]
 
-            if product_name:
-                # Get occurrence count from NAUO analysis
-                count = part_occurrence_count.get(pd_id, 1) if pd_id else 1
-                solid_info[solid_id] = (product_name, count)
+                if parent_pd not in children_map:
+                    children_map[parent_pd] = []
+                children_map[parent_pd].append(child_pd)
+
+                all_parents.add(parent_pd)
+                all_children.add(child_pd)
+
+        # Root PD is the one that appears as parent but never as child
+        root_candidates = all_parents - all_children
+        if root_candidates:
+            root_pd = next(iter(root_candidates))
+        else:
+            # Fallback: use the first parent found
+            root_pd = next(iter(all_parents)) if all_parents else -1
+
+        return children_map, root_pd
+
+    def _compute_recursive_counts(self, children_map: Dict[int, List[int]],
+                                   root_pd: int) -> Dict[int, int]:
+        """Compute recursive occurrence counts for all leaf PDs.
+
+        For each PRODUCT_DEFINITION that is a leaf (not a parent in children_map),
+        computes the total number of times it appears in the full assembly by
+        multiplying through the hierarchy.
+
+        Returns:
+            Dict mapping leaf PD id -> total recursive count
+        """
+        leaf_counts: Dict[int, int] = {}
+
+        def _count_leaf(target_pd: int, context_pd: int) -> int:
+            """Count how many times target_pd appears under context_pd."""
+            total = 0
+            for child_pd in children_map.get(context_pd, []):
+                if child_pd == target_pd:
+                    total += 1
+                else:
+                    # Each NAUO placement of this sub-assembly contributes its sub-count
+                    total += _count_leaf(target_pd, child_pd)
+            return total
+
+        # Find all leaf PDs (appear as children but not as parents)
+        all_pds = set()
+        for parent, children in children_map.items():
+            all_pds.add(parent)
+            for child in children:
+                all_pds.add(child)
+
+        leaf_pds = {pd for pd in all_pds if pd not in children_map}
+
+        for leaf_pd in leaf_pds:
+            count = _count_leaf(leaf_pd, root_pd)
+            if count > 0:
+                leaf_counts[leaf_pd] = count
+
+        return leaf_counts
+
+    def _find_solids_for_pd(self, pd_id: int) -> List[int]:
+        """Find all solid bodies associated with a PRODUCT_DEFINITION.
+
+        Follows the chain: PD -> PDS -> SDR -> SR/ABREP -> solids
+        Also follows SHAPE_REPRESENTATION_RELATIONSHIP links.
+        """
+        all_solid_ids = set(self._find_all_solid_bodies())
+        found_solids = []
+
+        # Find PRODUCT_DEFINITION_SHAPE referencing this PD
+        for pds_id in self.parser.find_entities_by_type("PRODUCT_DEFINITION_SHAPE"):
+            pds = self.parser.entities.get(pds_id)
+            if not pds or pd_id not in pds.references:
+                continue
+
+            # Find SHAPE_DEFINITION_REPRESENTATION referencing this PDS
+            for sdr_id in self.parser.find_entities_by_type("SHAPE_DEFINITION_REPRESENTATION"):
+                sdr = self.parser.entities.get(sdr_id)
+                if not sdr or pds_id not in sdr.references:
+                    continue
+
+                # Find the SHAPE_REPRESENTATION or ABREP referenced by SDR
+                for sdr_ref in sdr.references:
+                    if sdr_ref == pds_id:
+                        continue
+                    sr_entity = self.parser.entities.get(sdr_ref)
+                    if not sr_entity:
+                        continue
+
+                    if sr_entity.type == "ADVANCED_BREP_SHAPE_REPRESENTATION":
+                        # Direct ABREP - collect solids from it
+                        for ref in sr_entity.references:
+                            if ref in all_solid_ids:
+                                found_solids.append(ref)
+
+                    elif sr_entity.type == "SHAPE_REPRESENTATION":
+                        # Check if solids are directly in this SR
+                        for ref in sr_entity.references:
+                            if ref in all_solid_ids:
+                                found_solids.append(ref)
+
+                        # Also follow SHAPE_REPRESENTATION_RELATIONSHIP to ABREP
+                        for srr_id in self.parser.find_entities_by_type("SHAPE_REPRESENTATION_RELATIONSHIP"):
+                            srr = self.parser.entities.get(srr_id)
+                            if srr and sdr_ref in srr.references:
+                                for srr_ref in srr.references:
+                                    if srr_ref == sdr_ref:
+                                        continue
+                                    abrep = self.parser.entities.get(srr_ref)
+                                    if abrep and abrep.type == "ADVANCED_BREP_SHAPE_REPRESENTATION":
+                                        for ref in abrep.references:
+                                            if ref in all_solid_ids:
+                                                found_solids.append(ref)
+
+        return found_solids
+
+    def _split_assembly(self, output_dir: str, base_name: str) -> None:
+        """Split an assembly into individual parts with duplicate detection.
+
+        Handles multi-level assemblies by recursively counting through the
+        NAUO hierarchy, and handles multi-solid parts by extracting each
+        solid as a separate file.
+        """
+        # Build the NAUO parent-child tree
+        children_map, root_pd = self._build_nauo_tree()
+        print(f"  Assembly tree: root PD #{root_pd}")
+
+        # Compute recursive occurrence counts for all leaf PDs
+        leaf_counts = self._compute_recursive_counts(children_map, root_pd)
+        print(f"  Found {len(leaf_counts)} leaf parts in assembly hierarchy")
+
+        # For each leaf PD, find its associated solids
+        # A leaf PD may have 1 solid (normal) or many (e.g., bearings with 14 solids)
+        # solid_info: solid_id -> (display_name, recursive_count, pd_id)
+        solid_info: Dict[int, Tuple[str, int, int]] = {}
+
+        for pd_id, count in leaf_counts.items():
+            product_name = self._extract_product_name(self.parser.entities[pd_id])
+            solids_for_pd = self._find_solids_for_pd(pd_id)
+
+            if not solids_for_pd:
+                # Try finding solids the old way (via ABREP referencing the solid)
+                all_solids = self._find_all_solid_bodies()
+                for solid_id in all_solids:
+                    found_pd = self._find_product_definition_for_solid(solid_id)
+                    if found_pd == pd_id:
+                        solids_for_pd.append(solid_id)
+
+            if len(solids_for_pd) == 1:
+                # Single solid - use product name
+                solid_id = solids_for_pd[0]
+                name = product_name or self._get_solid_name(solid_id) or f"{base_name}_{solid_id}"
+                solid_info[solid_id] = (name, count, pd_id)
+            elif len(solids_for_pd) > 1:
+                # Multi-solid part (e.g., bearing with balls, races, etc.)
+                # Each solid gets its own file. Use solid's own name or entity type + ID.
+                for solid_id in solids_for_pd:
+                    solid_name = self._get_solid_name(solid_id)
+                    entity = self.parser.entities.get(solid_id)
+                    if solid_name:
+                        name = solid_name
+                    elif entity:
+                        # Fallback: ENTITY_TYPE_entityID (e.g., MANIFOLD_SOLID_BREP_17831)
+                        name = f"{entity.type}_{solid_id}"
+                    else:
+                        name = f"SOLID_{solid_id}"
+                    solid_info[solid_id] = (name, count, pd_id)
             else:
-                solid_info[solid_id] = (f"{base_name}-{solid_id}", 1)
+                print(f"  Warning: No solids found for PD #{pd_id} ({product_name})")
 
-        # Compute geometry hashes for duplicate detection (for geometrically identical parts)
+        # Also check for solids not associated with any leaf PD but referenced by NAUO
+        # (fallback for files where the PD→solid chain is different)
+        all_solids = self._find_all_solid_bodies()
+        covered_solids = set(solid_info.keys())
+        for solid_id in all_solids:
+            if solid_id in covered_solids:
+                continue
+            pd_id = self._find_product_definition_for_solid(solid_id)
+            if pd_id and pd_id in leaf_counts:
+                product_name = self._find_product_for_solid(solid_id)
+                name = product_name or self._get_solid_name(solid_id) or f"{base_name}_{solid_id}"
+                solid_info[solid_id] = (name, leaf_counts[pd_id], pd_id)
+
+        if not solid_info:
+            print("  No parts found in assembly hierarchy")
+            return
+
+        # Compute geometry hashes for duplicate detection
+        # Include PD ID in hash key so solids from different PRODUCT_DEFINITIONs
+        # are never merged (they represent physically distinct placements)
         print("Computing geometry hashes for duplicate detection...")
         hash_to_solids: Dict[str, List[Tuple[int, str, int]]] = {}
 
-        for solid_id, (product_name, count) in solid_info.items():
+        for solid_id, (display_name, count, pd_id) in solid_info.items():
             geo_hash = self.hasher.compute_geometry_hash(solid_id)
-            if geo_hash not in hash_to_solids:
-                hash_to_solids[geo_hash] = []
-            hash_to_solids[geo_hash].append((solid_id, product_name, count))
+            # Combine geometry hash with PD to prevent cross-PD merging
+            dedup_key = f"{geo_hash}_{pd_id}"
+            if dedup_key not in hash_to_solids:
+                hash_to_solids[dedup_key] = []
+            hash_to_solids[dedup_key].append((solid_id, display_name, count))
+
+        # Count how many unique entries share each display name
+        name_usage_count: Dict[str, int] = {}
+        for dedup_key, solids_list in hash_to_solids.items():
+            display_name = solids_list[0][1]
+            sanitized = self._sanitize_filename(display_name)
+            name_usage_count[sanitized] = name_usage_count.get(sanitized, 0) + 1
 
         # Export unique parts
         unique_count = 0
         total_instances = 0
 
-        for geo_hash, solids_list in hash_to_solids.items():
-            # Sum counts for geometrically identical parts
-            total_count = sum(item[2] for item in solids_list)
+        for dedup_key, solids_list in hash_to_solids.items():
+            # For geometrically identical solids within the same PD, take the max count
+            total_count = max(item[2] for item in solids_list)
             total_instances += total_count
 
             # Use the first solid and its name
-            solid_id, product_name, _ = solids_list[0]
+            solid_id, display_name, _ = solids_list[0]
             unique_count += 1
 
             # Collect dependencies
-            dependencies = self._collect_solid_dependencies(solid_id)
+            dependencies, context_id = self._collect_solid_dependencies(solid_id)
 
             # Generate filename
-            output_filename = self._sanitize_filename(product_name) + ".stp"
+            sanitized = self._sanitize_filename(display_name)
+            if name_usage_count.get(sanitized, 1) > 1:
+                output_filename = f"{sanitized}-{solid_id}.stp"
+            else:
+                output_filename = f"{sanitized}.stp"
             output_filepath = os.path.join(output_dir, output_filename)
 
             if total_count > 1:
-                print(f"Extracting part: {product_name} (x{total_count} instances)")
+                print(f"Extracting part: {display_name} (x{total_count} instances)")
             else:
-                print(f"Extracting part: {product_name}")
+                print(f"Extracting part: {display_name}")
 
-            self.writer.write_step_file(output_filepath, product_name, dependencies, self.parser)
+            self.writer.write_step_file(output_filepath, display_name, dependencies, self.parser,
+                                        solid_id=solid_id if context_id else None,
+                                        context_id=context_id)
             print(f"  -> Saved to: {output_filename}")
 
             # Add to report
-            self.part_report.append((product_name, total_count))
+            if name_usage_count.get(sanitized, 1) > 1:
+                report_name = f"{display_name}-{solid_id}"
+            else:
+                report_name = display_name
+            self.part_report.append((report_name, total_count))
 
         print(f"\nExtracted {unique_count} unique parts from {total_instances} total instances")
 
@@ -388,10 +630,31 @@ class StepSplitter:
                 hash_to_solids[geo_hash] = []
             hash_to_solids[geo_hash].append(solid_id)
 
+        # First pass: get part names and count how many unique geometries share each name
+        solid_to_name: Dict[int, str] = {}
+        name_usage_count: Dict[str, int] = {}
+
+        unique_count_temp = 0
+        for geo_hash, solids_list in hash_to_solids.items():
+            unique_count_temp += 1
+            solid_id = solids_list[0]
+
+            # Try to get part name from the solid body entity itself
+            part_name = self._get_solid_name(solid_id)
+            if not part_name:
+                # Fallback to product name lookup
+                part_name = self._find_product_for_solid(solid_id)
+            if not part_name:
+                # Final fallback: use base_name with counter
+                part_name = f"{base_name}_{unique_count_temp}"
+
+            solid_to_name[solid_id] = part_name
+            sanitized = self._sanitize_filename(part_name)
+            name_usage_count[sanitized] = name_usage_count.get(sanitized, 0) + 1
+
         # Export unique volumes
         unique_count = 0
         total_instances = len(solid_bodies)
-        used_names: Dict[str, int] = {}  # Track name usage for deduplication
 
         for geo_hash, solids_list in hash_to_solids.items():
             count = len(solids_list)
@@ -401,45 +664,39 @@ class StepSplitter:
             solid_id = solids_list[0]
 
             # Collect dependencies
-            dependencies = self._collect_solid_dependencies(solid_id)
+            dependencies, context_id = self._collect_solid_dependencies(solid_id)
 
-            # Try to get part name from the solid body entity itself
-            part_name = self._get_solid_name(solid_id)
-            if not part_name:
-                # Fallback to product name lookup
-                part_name = self._find_product_for_solid(solid_id)
-            if not part_name:
-                # Final fallback: use base_name with counter
-                part_name = f"{base_name}_{unique_count}"
-
-            # Handle duplicate names by adding entity ID suffix
+            part_name = solid_to_name[solid_id]
             sanitized = self._sanitize_filename(part_name)
-            if sanitized in used_names:
-                used_names[sanitized] += 1
-                part_name = f"{part_name}-{solid_id}"
-                sanitized = self._sanitize_filename(part_name)
-            else:
-                used_names[sanitized] = 1
 
-            output_filename = f"{sanitized}.stp"
+            # Append entity ID if multiple unique geometries share the same name
+            if name_usage_count.get(sanitized, 1) > 1:
+                final_name = f"{part_name}-{solid_id}"
+                output_filename = f"{sanitized}-{solid_id}.stp"
+            else:
+                final_name = part_name
+                output_filename = f"{sanitized}.stp"
+
             output_filepath = os.path.join(output_dir, output_filename)
 
             if count > 1:
-                print(f"Extracting volume {unique_count}: {part_name} (x{count} identical instances)")
+                print(f"Extracting volume {unique_count}: {final_name} (x{count} identical instances)")
             else:
-                print(f"Extracting volume {unique_count}: {part_name}")
+                print(f"Extracting volume {unique_count}: {final_name}")
 
-            self.writer.write_step_file(output_filepath, part_name, dependencies, self.parser)
+            self.writer.write_step_file(output_filepath, final_name, dependencies, self.parser,
+                                        solid_id=solid_id if context_id else None,
+                                        context_id=context_id)
             print(f"  -> Saved to: {output_filename}")
 
             # Add to report
-            self.part_report.append((part_name, count))
+            self.part_report.append((final_name, count))
 
         print(f"\nExtracted {unique_count} unique volumes from {total_instances} total instances")
 
     def _export_single_part(self, output_dir: str, base_name: str, solid_id: int) -> None:
         """Export a single part."""
-        dependencies = self._collect_solid_dependencies(solid_id)
+        dependencies, context_id = self._collect_solid_dependencies(solid_id)
 
         # Try to get part name from the solid body entity itself
         part_name = self._get_solid_name(solid_id)
@@ -454,16 +711,19 @@ class StepSplitter:
         output_filepath = os.path.join(output_dir, output_filename)
 
         print(f"Exporting single part: {part_name}")
-        self.writer.write_step_file(output_filepath, part_name, dependencies, self.parser)
+        self.writer.write_step_file(output_filepath, part_name, dependencies, self.parser,
+                                    solid_id=solid_id if context_id else None,
+                                    context_id=context_id)
         print(f"  -> Saved to: {output_filename}")
 
         self.part_report.append((part_name, 1))
 
     def _get_solid_name(self, solid_id: int) -> Optional[str]:
-        """Extract the name directly from a MANIFOLD_SOLID_BREP entity."""
+        """Extract the name directly from a solid body entity (MANIFOLD_SOLID_BREP or BREP_WITH_VOIDS)."""
         entity = self.parser.entities.get(solid_id)
-        if entity and entity.type == "MANIFOLD_SOLID_BREP":
+        if entity and entity.type in self.SOLID_TYPES:
             # MANIFOLD_SOLID_BREP('name',#shell_ref)
+            # BREP_WITH_VOIDS('name',#shell_ref,(#void_refs))
             # Extract the first quoted string (the name)
             match = re.search(r"'([^']*)'", entity.content)
             if match:
@@ -532,25 +792,50 @@ class StepSplitter:
                         return pd
         return None
 
-    def _collect_solid_dependencies(self, solid_id: int) -> Set[int]:
-        """Collect all entities required for a solid body, including product structure."""
+    def _collect_solid_dependencies(self, solid_id: int) -> Tuple[Set[int], Optional[int]]:
+        """Collect all entities required for a solid body, including product structure.
+
+        Returns:
+            Tuple of (entity_ids, context_id) where context_id is the geometric context
+            for creating a synthetic ABREP if the original ABREP contains multiple solids.
+        """
         required = set()
+        context_id = None
+
         # Get pure geometry dependencies (downward from solid)
         required.update(self.parser.get_transitive_dependencies(solid_id))
 
         # Add ADVANCED_BREP_SHAPE_REPRESENTATION that contains this solid
         # This provides the geometric context and units needed by OpenCASCADE
         abrep_id_found = None
+
+        # Get all solid body IDs so we can exclude them when processing ABREP references
+        all_solid_ids = set(self._find_all_solid_bodies())
+
         for abrep_id in self.parser.find_entities_by_type("ADVANCED_BREP_SHAPE_REPRESENTATION"):
             abrep = self.parser.entities.get(abrep_id)
             if abrep and solid_id in abrep.references:
                 abrep_id_found = abrep_id
-                required.add(abrep_id)
-                # Add the context/units referenced by ABREP
-                for ref in abrep.references:
-                    if ref != solid_id:
-                        required.add(ref)
-                        required.update(self.parser.get_transitive_dependencies(ref))
+
+                # Check if this ABREP contains multiple solids
+                solids_in_abrep = [ref for ref in abrep.references if ref in all_solid_ids]
+
+                if len(solids_in_abrep) > 1:
+                    # Multiple solids share this ABREP - don't include it directly
+                    # Extract context/units for creating a synthetic ABREP
+                    for ref in abrep.references:
+                        if ref not in all_solid_ids:
+                            # This is the geometric context
+                            context_id = ref
+                            required.add(ref)
+                            required.update(self.parser.get_transitive_dependencies(ref))
+                else:
+                    # Single solid in ABREP - include it as-is
+                    required.add(abrep_id)
+                    for ref in abrep.references:
+                        if ref != solid_id:
+                            required.add(ref)
+                            required.update(self.parser.get_transitive_dependencies(ref))
                 break
 
         # Add product structure entities (PRODUCT_DEFINITION, PRODUCT, etc.)
@@ -559,7 +844,7 @@ class StepSplitter:
         # Add styling for this specific solid only
         self._add_styled_items_for_solid(required, solid_id)
 
-        return required
+        return required, context_id
 
     def _add_product_structure(self, entities: Set[int], solid_id: int,
                                 abrep_id: Optional[int]) -> None:
